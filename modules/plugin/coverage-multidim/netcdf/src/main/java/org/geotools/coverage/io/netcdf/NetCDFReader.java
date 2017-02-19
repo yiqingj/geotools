@@ -2,7 +2,7 @@
  *    GeoTools - The Open Source Java GIS Toolkit
  *    http://geotools.org
  *
- *    (C) 2007-2015, Open Source Geospatial Foundation (OSGeo)
+ *    (C) 2007-2016, Open Source Geospatial Foundation (OSGeo)
  *
  *    This library is free software; you can redistribute it and/or
  *    modify it under the terms of the GNU Lesser General Public
@@ -15,8 +15,6 @@
  *    Lesser General Public License for more details.
  */
 package org.geotools.coverage.io.netcdf;
-
-import it.geosolutions.imageio.utilities.ImageIOUtilities;
 
 import java.awt.Rectangle;
 import java.awt.geom.AffineTransform;
@@ -106,6 +104,8 @@ import org.opengis.referencing.datum.PixelInCell;
 import org.opengis.referencing.operation.MathTransform;
 import org.opengis.referencing.operation.MathTransform2D;
 import org.opengis.referencing.operation.TransformException;
+
+import it.geosolutions.imageio.utilities.ImageIOUtilities;
 
 /**
  * A NetCDF Reader implementation
@@ -577,7 +577,7 @@ public class NetCDFReader extends AbstractGridCoverage2DReader implements Struct
             if (value == null)
                 return;
             List<?> values = (List<?>) value;
-            if (values != null && !values.isEmpty()) {
+            if (!values.isEmpty()) {
                 Set<NumberRange<Double>> verticalSubset = new DoubleRangeTreeSet();
                 for (Object val : values) {
                     if (val instanceof Number) {
@@ -600,6 +600,13 @@ public class NetCDFReader extends AbstractGridCoverage2DReader implements Struct
             return;
         }
 
+        // setup the the bands parameter which defines the order and the bands that should bereturned
+        if (name.equals(ImageMosaicFormat.BANDS.getName())) {
+            // if the parameter is NULL no problem
+            request.setBands((int[]) param.getValue());
+            return;
+        }
+
         String paramName = name.getCode();
         if (((NetCDFSource) gridSource).isParameterSupported(name)) {
             final Object value = param.getValue();
@@ -619,8 +626,7 @@ public class NetCDFReader extends AbstractGridCoverage2DReader implements Struct
                 domainsSubset = new HashMap<String, Set<?>>();
                 request.setAdditionalDomainsSubset(domainsSubset);
             }
-            domainsSubset.put(paramName, values);            
-            return;
+            domainsSubset.put(paramName, values);
         }
     }
 
@@ -721,18 +727,17 @@ public class NetCDFReader extends AbstractGridCoverage2DReader implements Struct
 
     private String checkUnspecifiedCoverage(String coverageName) {
         if (coverageName.equalsIgnoreCase(UNSPECIFIED)) {
-            if (getGridCoverageCount() > 1) {
+            if (defaultName == null) {
                 throw new IllegalArgumentException(
-                        "Need to specify the coverageName for a reader related to multiple coverages");
+                        "coverageName not specified and no defaultName for " + sourceURL);
             } else {
                 return defaultName;
             }
+        } else if (!setNames.contains(coverageName)) {
+            throw new IllegalArgumentException(
+                    "coverageName " + coverageName + " not found for " + sourceURL);
         } else {
-            if (!setNames.contains(coverageName)) {
-                throw new IllegalArgumentException("The specified coverageName is unavailable");
-            } else {
-                return coverageName;
-            }
+            return coverageName;
         }
     }
 

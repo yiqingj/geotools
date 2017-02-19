@@ -87,6 +87,12 @@ When creating the first release candidate of a series, there are some extra step
       
 * Create the new beta version in `JIRA <https://osgeo-org.atlassian.net/projects/GEOT>`_ for issues on master; for example, if master is now ``14-SNAPSHOT``, create a Jira version ``14-beta`` for the first release of the ``14.x`` series
 
+* Update the jobs on ares:
+  
+  * disable the maintenance jobs, and remove them from the geotools view
+  * create new jobs, create from the exsisting master jobs, editing the branch and the DIST=stable configuration
+  * edit the previous stable branch, changing to DIST=maintenance
+
 * Announce on the developer mailing list that the new stable branch has been created and that the feature freeze on master is over
 
 Build the Release
@@ -132,7 +138,7 @@ any random user out there can do the same.
 A simple way to do so is:
 
 *  Unpack the sources
-*  Temporarily move the ``$HOME/.m2/repository`` to a different location, so that Maven will be forced to build from an empty repo
+*  Temporarily move the ``$HOME/.m2/repository`` to a different location, so that Maven will be forced to build from an empty repo. If you don't want to fiddle with your main repo just use ``mvn -Dmaven.repo.local=/tmp/m2 install -Dall -T1C`` where it points to any empty directory.
 *  Do a full build using ``mvn install -Dall -T1C``
 *  On a successfull build, delete ``$HOME/.m2/repository`` and restore the old maven repository backed up at the beginning
  

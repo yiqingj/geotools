@@ -44,7 +44,7 @@ import org.geotools.image.ImageWorker;
 import org.geotools.resources.geometry.XRectangle2D;
 import org.geotools.resources.image.ImageUtilities;
 import org.geotools.util.logging.Logging;
-import org.jaitools.imageutils.ROIGeometry;
+import it.geosolutions.jaiext.vectorbin.ROIGeometry;
 
 import it.geosolutions.imageio.pam.PAMDataset;
 import it.geosolutions.jaiext.range.NoDataContainer;
@@ -239,6 +239,10 @@ public class Mosaicker {
                                 // Adding globalRoi to the output
                                 RenderedOp rop = (RenderedOp) mosaic;
                                 rop.setProperty("ROI", in.roi);
+
+
+                                mosaic = rasterLayerResponse.getFootprintBehavior().postProcessMosaic(mosaic, in.roi,
+                                    localHints);
                             }
                         }
 

@@ -16,16 +16,6 @@
  */
 package org.geotools.gce.imagemosaic;
 
-import java.awt.Color;
-import java.awt.Dimension;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-
-import javax.media.jai.Interpolation;
-
 import org.geotools.coverage.grid.GridGeometry2D;
 import org.geotools.coverage.grid.io.AbstractGridFormat;
 import org.geotools.coverage.grid.io.DecimationPolicy;
@@ -37,12 +27,16 @@ import org.geotools.factory.Hints;
 import org.geotools.gce.imagemosaic.SpatialRequestHelper.CoverageProperties;
 import org.opengis.filter.Filter;
 import org.opengis.metadata.Identifier;
-import org.opengis.parameter.GeneralParameterDescriptor;
-import org.opengis.parameter.GeneralParameterValue;
-import org.opengis.parameter.ParameterDescriptor;
-import org.opengis.parameter.ParameterValue;
-import org.opengis.parameter.ParameterValueGroup;
+import org.opengis.parameter.*;
 import org.opengis.referencing.ReferenceIdentifier;
+
+import javax.media.jai.Interpolation;
+import java.awt.*;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * A class to handle coverage requests to a reader for a single 2D layer..
@@ -116,8 +110,16 @@ public class RasterLayerRequest {
 
     private final Map<String, List> requestedAdditionalDomains = new HashMap<String, List>();
 
-    /** Sort clause on shapefile attributes. */
+    // the bands parameter define the order and which bands should be returned
+    private int[] bands;
+
+    /** Sort clause on data source. */
     private String sortClause;
+
+    /*
+     * Enables/disables excess granule removal
+     */
+    private ExcessGranulePolicy excessGranuleRemovalPolicy;
 
     public List<?> getElevation() {
         return elevation;
@@ -149,6 +151,14 @@ public class RasterLayerRequest {
 
     public boolean isHeterogeneousGranules() {
         return heterogeneousGranules;
+    }
+
+    public ExcessGranulePolicy getExcessGranuleRemovalPolicy() {
+        return excessGranuleRemovalPolicy;
+    }
+
+    public void setExcessGranuleRemovalPolicy(ExcessGranulePolicy policy) {
+        this.excessGranuleRemovalPolicy = policy;
     }
 
     public void setHeterogeneousGranules(final boolean heterogeneousGranules) {
@@ -418,6 +428,13 @@ public class RasterLayerRequest {
                 accurateResolution = ((Boolean) value).booleanValue();
                 return;
             }
+            
+            if (name.equals(ImageMosaicFormat.EXCESS_GRANULE_REMOVAL.getName())) {
+                if (value == null)
+                    continue;
+                excessGranuleRemovalPolicy = (ExcessGranulePolicy) value;
+                return;
+            }
         }
 
     }
@@ -493,6 +510,9 @@ public class RasterLayerRequest {
             if (value == null)
                 return;
             overviewPolicy = (OverviewPolicy) value;
+            if (LOGGER.isLoggable(Level.FINE)) {
+                LOGGER.fine("Requested OverviewPolicy: " + overviewPolicy);
+            }
             return;
         }
 
@@ -506,6 +526,9 @@ public class RasterLayerRequest {
             if (value == null)
                 return;
             decimationPolicy = (DecimationPolicy) value;
+            if (LOGGER.isLoggable(Level.FINE)) {
+                LOGGER.fine("Requested DecimationPolicy: " + decimationPolicy);
+            }
             return;
         }
 
@@ -519,6 +542,9 @@ public class RasterLayerRequest {
             if (value == null)
                 return;
             interpolation = (Interpolation) value;
+            if (LOGGER.isLoggable(Level.FINE)) {
+                LOGGER.fine("Requested interpolation: " + interpolation);
+            }
             return;
         }
 
@@ -709,6 +735,23 @@ public class RasterLayerRequest {
             }
             return;
         }
+
+        // setup the the bands parameter which defines the order and the bands that should be returned
+        if (name.equals(ImageMosaicFormat.BANDS.getName())) {
+            // if the parameter is NULL no problem
+            bands = (int[]) param.getValue();
+        }
+
+        // see if we have to perform excess granule removal
+        if (name.equals(ImageMosaicFormat.EXCESS_GRANULE_REMOVAL.getName())) {
+            final Object value = param.getValue();
+            if (value == null) {
+                return;
+            }
+            excessGranuleRemovalPolicy = (ExcessGranulePolicy) value;
+            return;
+        }
+
     }
 
     /**
@@ -832,4 +875,7 @@ public class RasterLayerRequest {
         return spatialRequestHelper.isEmpty();
     }
 
+    public int[] getBands() {
+        return bands;
+    }
 }

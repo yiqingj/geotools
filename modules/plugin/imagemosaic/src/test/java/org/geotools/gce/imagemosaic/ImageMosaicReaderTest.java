@@ -17,16 +17,13 @@
 package org.geotools.gce.imagemosaic;
 
 import static org.hamcrest.CoreMatchers.instanceOf;
-import it.geosolutions.imageio.pam.PAMDataset;
-import it.geosolutions.imageio.pam.PAMDataset.PAMRasterBand;
-import it.geosolutions.imageio.pam.PAMParser;
-import it.geosolutions.imageio.utilities.ImageIOUtilities;
-import it.geosolutions.jaiext.JAIExt;
+import static org.hamcrest.CoreMatchers.is;
 
 import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.Rectangle;
 import java.awt.color.ColorSpace;
+import java.awt.geom.Point2D;
 import java.awt.geom.Rectangle2D;
 import java.awt.image.ColorModel;
 import java.awt.image.ComponentColorModel;
@@ -35,6 +32,7 @@ import java.awt.image.DataBuffer;
 import java.awt.image.IndexColorModel;
 import java.awt.image.Raster;
 import java.awt.image.RenderedImage;
+import java.awt.image.SampleModel;
 import java.io.File;
 import java.io.FileFilter;
 import java.io.FileInputStream;
@@ -68,9 +66,6 @@ import java.util.logging.Logger;
 import javax.media.jai.RenderedOp;
 import javax.swing.JFrame;
 
-import junit.framework.JUnit4TestAdapter;
-import junit.textui.TestRunner;
-
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
@@ -103,6 +98,7 @@ import org.geotools.data.simple.SimpleFeatureIterator;
 import org.geotools.factory.Hints;
 import org.geotools.feature.simple.SimpleFeatureBuilder;
 import org.geotools.filter.text.ecql.ECQL;
+import org.geotools.gce.geotiff.GeoTiffWriter;
 import org.geotools.gce.imagemosaic.Utils.Prop;
 import org.geotools.gce.imagemosaic.catalog.GranuleCatalog;
 import org.geotools.gce.imagemosaic.catalog.index.Indexer;
@@ -115,6 +111,7 @@ import org.geotools.geometry.GeneralEnvelope;
 import org.geotools.geometry.jts.ReferencedEnvelope;
 import org.geotools.image.test.ImageAssert;
 import org.geotools.jdbc.JDBCDataStore;
+import org.geotools.parameter.DefaultParameterDescriptorGroup;
 import org.geotools.referencing.CRS;
 import org.geotools.referencing.crs.DefaultGeographicCRS;
 import org.geotools.resources.coverage.CoverageUtilities;
@@ -135,9 +132,11 @@ import org.opengis.filter.Filter;
 import org.opengis.filter.FilterFactory2;
 import org.opengis.geometry.Envelope;
 import org.opengis.geometry.MismatchedDimensionException;
+import org.opengis.parameter.GeneralParameterDescriptor;
 import org.opengis.parameter.GeneralParameterValue;
 import org.opengis.parameter.ParameterDescriptor;
 import org.opengis.parameter.ParameterValue;
+import org.opengis.parameter.ParameterValueGroup;
 import org.opengis.referencing.FactoryException;
 import org.opengis.referencing.datum.PixelInCell;
 import org.opengis.referencing.operation.MathTransform;
@@ -147,6 +146,14 @@ import org.opengis.referencing.operation.TransformException;
 import com.vividsolutions.jts.geom.Coordinate;
 import com.vividsolutions.jts.geom.GeometryFactory;
 import com.vividsolutions.jts.geom.LinearRing;
+
+import it.geosolutions.imageio.pam.PAMDataset;
+import it.geosolutions.imageio.pam.PAMDataset.PAMRasterBand;
+import it.geosolutions.imageio.pam.PAMParser;
+import it.geosolutions.imageio.utilities.ImageIOUtilities;
+import it.geosolutions.jaiext.JAIExt;
+import junit.framework.JUnit4TestAdapter;
+import junit.textui.TestRunner;
 
 /**
  * Testing {@link ImageMosaicReader}.
@@ -345,6 +352,18 @@ public class ImageMosaicReaderTest extends Assert{
 //	@Ignore
 	public void overviews() throws Exception {
 		final AbstractGridFormat format = TestUtils.getFormat(overviewURL);
+		ParameterValueGroup readParams = format.getReadParameters();
+		final DefaultParameterDescriptorGroup descriptor = (DefaultParameterDescriptorGroup) readParams.getDescriptor();
+		List<GeneralParameterDescriptor> descriptors = descriptor.descriptors();
+		boolean hasOverviewPolicyParam = false;
+		for (GeneralParameterDescriptor desc: descriptors) {
+		    if (AbstractGridFormat.OVERVIEW_POLICY.getName().toString().equalsIgnoreCase(
+		            desc.getName().toString())) {
+		        hasOverviewPolicyParam = true;
+		        break;
+		    }
+		}
+		assertTrue(hasOverviewPolicyParam);
 		final ImageMosaicReader reader = TestUtils.getReader(overviewURL, format);
 
 		// limit yourself to reading just a bit of it
@@ -1921,10 +1940,25 @@ public class ImageMosaicReaderTest extends Assert{
 		outTransp.setValue(Color.black);
 
 
-		// test the coverage
-		TestUtils.checkCoverage(reader, new GeneralParameterValue[] { gg, outTransp },title);
-
+        final double[] baseResolutions = reader.getResolutionLevels()[0];
+        // test the coverage
+        final double tolerance = Math.max(baseResolutions[0], baseResolutions[1]) * 10;
+        GridCoverage2D coverage = TestUtils.checkCoverage(reader,
+                new GeneralParameterValue[] { gg, outTransp }, title);
+        // the envelope is the requested one
+        assertEnvelope(coverage.getEnvelope(), cropEnvelope, tolerance);
+        // the raster space ordinates are not far away from the origin
+        RenderedImage ri = coverage.getRenderedImage();
+        assertEquals(0, ri.getMinX(), 10);
+        assertEquals(0, ri.getMinY(), 10);
 	}
+	
+    void assertEnvelope(Envelope expected, Envelope actual, double tolerance) {
+        assertEquals(expected.getMinimum(0), actual.getMinimum(0), tolerance);
+        assertEquals(expected.getMaximum(0), actual.getMaximum(0), tolerance);
+        assertEquals(expected.getMinimum(1), actual.getMinimum(1), tolerance);
+        assertEquals(expected.getMaximum(1), actual.getMaximum(1), tolerance);
+    }
 	
     @Test
     //@Ignore
@@ -1950,10 +1984,8 @@ public class ImageMosaicReaderTest extends Assert{
         assertTrue(coverage.getEnvelope2D().intersects((Rectangle2D) env));
         
         // and that the color is the expected one given the background values provided
-        RenderedImage ri = coverage.getRenderedImage();
         int[] pixel = new int[4];
-        Raster tile = ri.getTile(ri.getMinTileX(), ri.getMinTileY());
-        tile.getPixel(411, 87, pixel);
+        coverage.evaluate(new Point2D.Double(497987,3197819), pixel);
         assertEquals(255, pixel[0]);
         assertEquals(0, pixel[1]);
         assertEquals(0, pixel[2]);
@@ -1982,14 +2014,12 @@ public class ImageMosaicReaderTest extends Assert{
         // read and check we actually got a coverage in the requested area
         GridCoverage2D coverage = reader.read(new GeneralParameterValue[] {ggp, bgp});
         assertNotNull(coverage);
-        assertTrue(coverage.getEnvelope2D().contains((Rectangle2D) env));
+        final Envelope2D envelope2d = coverage.getEnvelope2D();
+        assertTrue(envelope2d.contains((Rectangle2D) env));
         
         // and that the color is the expected one given the background values provided
-        RenderedImage ri = coverage.getRenderedImage();
         int[] pixel = new int[4];
-        Raster tile = ri.getTile(ri.getMinTileX() + ri.getNumXTiles()  - 1, 
-                ri.getMinTileY() + ri.getNumYTiles() - 1);
-        tile.getPixel(410, 120, pixel);
+        coverage.evaluate(new Point2D.Double(430000, 2700000), pixel);
         assertEquals(255, pixel[0]);
         assertEquals(0, pixel[1]);
         assertEquals(0, pixel[2]);
@@ -2000,39 +2030,41 @@ public class ImageMosaicReaderTest extends Assert{
     public void testRequestInAreaWithNoGranulesBecomesTransparent() throws Exception {
         final AbstractGridFormat format = TestUtils.getFormat(rgbURL);
         final ImageMosaicReader reader = TestUtils.getReader(rgbURL, format);
+        try {
+            assertNotNull(reader);
 
-        assertNotNull(reader);
+            // ask to extract an area that is inside the coverage bbox, but it doesn't cover any granule.
+            // the output should be transparent
+            final ParameterValue<GridGeometry2D> ggp =  AbstractGridFormat.READ_GRIDGEOMETRY2D.createValue();
+            Envelope2D env = new Envelope2D(reader.getCoordinateReferenceSystem(), 19, 45, 1, 1);
+            GridGeometry2D gg = new GridGeometry2D(new GridEnvelope2D(0, 0, 50, 50), (Envelope) env);
+            ggp.setValue(gg);
 
-        // ask to extract an area that is inside the coverage bbox, but it doesn't cover any granule.
-        // the output should be transparent
-        final ParameterValue<GridGeometry2D> ggp =  AbstractGridFormat.READ_GRIDGEOMETRY2D.createValue();
-        Envelope2D env = new Envelope2D(reader.getCoordinateReferenceSystem(), 19, 45, 1, 1);
-        GridGeometry2D gg = new GridGeometry2D(new GridEnvelope2D(0, 0, 50, 50), (Envelope) env);
-        ggp.setValue(gg);
+            // Setting transparency
+            final ParameterValue<Color> transparent =  ImageMosaicFormat.INPUT_TRANSPARENT_COLOR.createValue();
+            transparent.setValue(new Color(0, 0, 0));
 
-        // Setting transparency
-        final ParameterValue<Color> transparent =  ImageMosaicFormat.INPUT_TRANSPARENT_COLOR.createValue();
-        transparent.setValue(new Color(0, 0, 0));
+            // read and check we actually got a coverage in the requested area
+            GridCoverage2D coverage = reader.read(new GeneralParameterValue[] {ggp, transparent});
+            assertNotNull(coverage);
+            assertTrue(coverage.getEnvelope2D().contains((Rectangle2D) env));
 
-        // read and check we actually got a coverage in the requested area
-        GridCoverage2D coverage = reader.read(new GeneralParameterValue[] {ggp, transparent});
-        assertNotNull(coverage);
-        assertTrue(coverage.getEnvelope2D().contains((Rectangle2D) env));
-
-        RenderedImage ri = coverage.getRenderedImage();
-        int[] pixel = new int[] { Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE,
-                Integer.MAX_VALUE };
-        ri.getData().getPixel(220, 15, pixel);
-        assertEquals(0, pixel[0]);
-        assertEquals(0, pixel[1]);
-        assertEquals(0, pixel[2]);
-
-        // We only have input RGB granules.
-        // The mosaic should have been added the alpha component.
-        // Moreover it should have been set to fully transparent (0)
-        // since no granules are available in the requested area.
-        assertEquals(0, pixel[3]);
+            int[] pixel = new int[] { Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE,
+                    Integer.MAX_VALUE };
+            coverage.evaluate(new Point2D.Double(20,  45), pixel);
+            assertEquals(0, pixel[0]);
+            assertEquals(0, pixel[1]);
+            assertEquals(0, pixel[2]);
+            // We only have input RGB granules.
+            // The mosaic should have been added the alpha component.
+            // Moreover it should have been set to fully transparent (0)
+            // since no granules are available in the requested area.
+            assertEquals(0, pixel[3]);
+        } finally {
+        reader.dispose();
+        }
     }
+        
 
 	/**
 	 * @param args
@@ -4266,4 +4298,17 @@ public class ImageMosaicReaderTest extends Assert{
         }
     }
 
+    @Test
+    public void testBandsSelection() throws Exception {
+        // instantiate image mosaic reader
+        AbstractGridFormat format = TestUtils.getFormat(rgbURL);
+        ImageMosaicReader reader = TestUtils.getReader(rgbURL, format);
+        // reade the coverage select bands in different order and multiple times
+        ParameterValue<int[]> selectedBands = AbstractGridFormat.BANDS.createValue();
+        selectedBands.setValue(new int[]{2, 0, 1, 0 ,1});
+        GridCoverage2D coverage = TestUtils.checkCoverage(reader, new GeneralParameterValue[]{selectedBands}, null);
+        // checking that we have five bands (the bands selection operation was delegated on JAI BandsSelect operation)
+        SampleModel sampleModel = coverage.getRenderedImage().getSampleModel();
+        assertThat(sampleModel.getNumBands(), is(5));
+    }
 }

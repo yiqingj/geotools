@@ -24,6 +24,7 @@ import static org.junit.Assert.assertTrue;
 import java.awt.Dimension;
 import java.awt.Rectangle;
 import java.awt.Transparency;
+import java.awt.geom.Point2D;
 import java.awt.image.Raster;
 import java.awt.image.RenderedImage;
 import java.io.File;
@@ -51,6 +52,7 @@ import org.geotools.data.simple.SimpleFeatureStore;
 import org.geotools.feature.simple.SimpleFeatureBuilder;
 import org.geotools.feature.simple.SimpleFeatureTypeBuilder;
 import org.geotools.geometry.DirectPosition2D;
+import org.geotools.geometry.jts.ReferencedEnvelope;
 import org.geotools.referencing.CRS;
 import org.geotools.referencing.crs.DefaultGeographicCRS;
 import org.geotools.resources.coverage.CoverageUtilities;
@@ -59,16 +61,20 @@ import org.geotools.test.TestData;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 import org.opengis.feature.Feature;
 import org.opengis.feature.FeatureVisitor;
 import org.opengis.feature.simple.SimpleFeature;
 import org.opengis.feature.simple.SimpleFeatureType;
 import org.opengis.feature.type.GeometryDescriptor;
+import org.opengis.geometry.Envelope;
 import org.opengis.parameter.GeneralParameterValue;
 import org.opengis.parameter.ParameterValue;
 import org.opengis.referencing.FactoryException;
 import org.opengis.referencing.NoSuchAuthorityCodeException;
+import org.opengis.referencing.crs.CoordinateReferenceSystem;
 import org.opengis.referencing.datum.PixelInCell;
 import org.opengis.referencing.operation.MathTransform;
 
@@ -406,7 +412,7 @@ public class ImageMosaicFootprintsTest {
         // check the footprints have been applied by pocking the output image
         pixel = new byte[4];
         // Close to San Marino, black if we have the insets
-        coverage.evaluate(tr.transform(new DirectPosition2D(coverage.getRenderedImage().getMinX(),coverage.getRenderedImage().getMinY()),null), pixel);
+        coverage.evaluate(new DirectPosition2D(coverage.getEnvelope().getMinimum(0) + 1e-3, coverage.getEnvelope().getMinimum(1) + 1e-3), pixel);
 
         assertEquals(0, pixel[0]);
         assertEquals(0, pixel[1]);
@@ -462,7 +468,7 @@ public class ImageMosaicFootprintsTest {
         jaiImageRead.setValue(false); 
         params[1] = jaiImageRead;
         
-        // GridGeometry, small aread at the upper right corner
+        // GridGeometry, small read at the upper right corner
         final GridEnvelope2D ge2D= new GridEnvelope2D(
                 reader.getOriginalGridRange().getHigh(0)-3, 
                 reader.getOriginalGridRange().getLow(1), 
@@ -481,8 +487,7 @@ public class ImageMosaicFootprintsTest {
         // check the footprints have been applied by pocking the output image
         pixel = new byte[4];
         // Close to San Marino, black if we have the insets
-        coverage.evaluate(tr.transform(new DirectPosition2D(coverage.getRenderedImage().getMinX(),coverage.getRenderedImage().getMinY()),null), pixel);
-//        RenderedImageBrowser.showChain(coverage.getRenderedImage());
+        coverage.evaluate(new DirectPosition2D(coverage.getEnvelope().getMinimum(0)  + 1e-3 ,coverage.getEnvelope().getMinimum(1) + 1e-3), pixel);
         assertEquals(0, pixel[0]);
         assertEquals(0, pixel[1]);
         assertEquals(0, pixel[2]);
@@ -940,4 +945,43 @@ public class ImageMosaicFootprintsTest {
 
         return coverage;
     }
+
+    @Rule
+    public TemporaryFolder redFootprintFolder = new TemporaryFolder();
+    /**
+     * When the mosaic bounds don't match the requested image bounds, there's only one granule in the requested bounds
+     * and FootprintBehavior is transparent a border is added to the image. This actually only happens in
+     * very specific circumstances, like in the test data which is an L shaped. In this case the
+     * footprint behavior was not being respected, resulting in a background color even though the
+     * background should be transparent.
+     *
+     */
+    @Test
+    public void testFootprintWithBorderNeeded() throws IOException {
+        File testFolder = redFootprintFolder.newFolder();
+        File mosaic = TestData.file(this, "red_footprint_test");
+        FileUtils.copyDirectory(mosaic, testFolder);
+        ImageMosaicReader reader = (ImageMosaicReader) new ImageMosaicFormatFactory().createFormat()
+            .getReader(testFolder);
+
+        ParameterValue<String> footprintBehaviorParam = AbstractGridFormat.FOOTPRINT_BEHAVIOR.createValue();
+        footprintBehaviorParam.setValue(FootprintBehavior.Transparent.name());
+
+        ParameterValue<GridGeometry2D> readGeom = AbstractGridFormat.READ_GRIDGEOMETRY2D.createValue();
+
+        CoordinateReferenceSystem coordinateReferenceSystem = reader.getOriginalEnvelope()
+            .getCoordinateReferenceSystem();
+
+        GridEnvelope2D gridRange = new GridEnvelope2D(0,0,100,100);
+        Envelope requestEnvelope = new ReferencedEnvelope(989964.5828856088,
+            990881.0173239836, 218260.08651691137, 219176.52095528613, coordinateReferenceSystem);
+        GridGeometry2D readGeometry = new GridGeometry2D(gridRange, requestEnvelope);
+        readGeom.setValue(readGeometry);
+        GeneralParameterValue[] readParams = new GeneralParameterValue[]{footprintBehaviorParam, readGeom};
+        GridCoverage2D coverage = reader.read(readParams);
+
+        int numComponents = coverage.getRenderedImage().getColorModel().getNumComponents();
+        assertEquals(numComponents, 4);
+    }
+
 }

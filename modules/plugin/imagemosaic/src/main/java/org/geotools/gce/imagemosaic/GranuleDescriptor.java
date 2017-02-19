@@ -22,6 +22,7 @@ import java.awt.RenderingHints;
 import java.awt.geom.AffineTransform;
 import java.awt.geom.NoninvertibleTransformException;
 import java.awt.geom.Rectangle2D;
+import java.awt.image.ColorModel;
 import java.awt.image.RenderedImage;
 import java.io.File;
 import java.io.IOException;
@@ -58,8 +59,8 @@ import org.geotools.coverage.grid.io.GridFormatFinder;
 import org.geotools.coverage.grid.io.footprint.FootprintBehavior;
 import org.geotools.coverage.grid.io.footprint.MultiLevelROI;
 import org.geotools.coverage.grid.io.imageio.MaskOverviewProvider;
-import org.geotools.coverage.grid.io.imageio.ReadType;
 import org.geotools.coverage.grid.io.imageio.MaskOverviewProvider.SpiHelper;
+import org.geotools.coverage.grid.io.imageio.ReadType;
 import org.geotools.data.DataUtilities;
 import org.geotools.factory.Hints;
 import org.geotools.factory.Hints.Key;
@@ -78,9 +79,9 @@ import org.geotools.resources.geometry.XRectangle2D;
 import org.geotools.resources.i18n.ErrorKeys;
 import org.geotools.resources.i18n.Errors;
 import org.geotools.resources.image.ImageUtilities;
-import org.jaitools.imageutils.ROIGeometry;
-import org.jaitools.media.jai.vectorbinarize.VectorBinarizeDescriptor;
-import org.jaitools.media.jai.vectorbinarize.VectorBinarizeRIF;
+import it.geosolutions.jaiext.vectorbin.ROIGeometry;
+import it.geosolutions.jaiext.vectorbin.VectorBinarizeDescriptor;
+import it.geosolutions.jaiext.vectorbin.VectorBinarizeRIF;
 import org.opengis.feature.simple.SimpleFeature;
 import org.opengis.geometry.BoundingBox;
 import org.opengis.referencing.crs.CoordinateReferenceSystem;
@@ -250,6 +251,8 @@ public class GranuleDescriptor {
         boolean doFiltering;
 
         PAMDataset pamDataset;
+        
+        GranuleDescriptor granuleDescriptor;
 
         public ROI getFootprint() {
             return footprint;
@@ -274,9 +277,13 @@ public class GranuleDescriptor {
         public boolean isDoFiltering() {
             return doFiltering;
         }
+        
+        public GranuleDescriptor getGranuleDescriptor() {
+            return granuleDescriptor;
+        }
 
         GranuleLoadingResult(RenderedImage loadedImage, ROI footprint, URL granuleUrl,
-                final boolean doFiltering, final PAMDataset pamDataset) {
+                final boolean doFiltering, final PAMDataset pamDataset, GranuleDescriptor granuleDescriptor) {
             this.loadedImage = loadedImage;
             Object roi = loadedImage.getProperty("ROI");
             if (roi instanceof ROI) {
@@ -285,7 +292,9 @@ public class GranuleDescriptor {
             this.granuleUrl = granuleUrl;
             this.doFiltering = doFiltering;
             this.pamDataset = pamDataset;
+            this.granuleDescriptor = granuleDescriptor;
         }
+
     }
 
     private static PAMParser pamParser = PAMParser.getInstance();
@@ -773,6 +782,15 @@ public class GranuleDescriptor {
             customizeReaderInitialization(reader, hints);
             reader.setInput(inStream);
 
+            // check if the reader wants to be aware of the current request
+            if (MethodUtils.getAccessibleMethod(reader.getClass(), "setRasterLayerRequest", RasterLayerRequest.class) != null) {
+                try {
+                    MethodUtils.invokeMethod(reader, "setRasterLayerRequest", request);
+                } catch(Exception exception) {
+                    throw new RuntimeException("Error setting raster layer request on reader.", exception);
+                }
+            }
+
             // Checking for heterogeneous granules and if the mosaic is not multidimensional
             if (request.isHeterogeneousGranules() && (originator == null || originator.getAttribute("imageindex") == null)) {
                 // create read parameters
@@ -911,6 +929,28 @@ public class GranuleDescriptor {
                 return null;
             }
 
+            // perform band selection if necessary, so far netcdf is the only low level reader that
+            // handles bands selection, if more readers start to support it a decent approach should
+            // be used to know if the low level reader already performed the bands selection or if
+            // image mosaic is responsible for do it
+            if(request.getBands() != null && !reader.getFormatName().equalsIgnoreCase("netcdf")) {
+                int[] bands = request.getBands();
+                // delegate the band selection operation on JAI BandSelect operation
+                raster = new ImageWorker(raster).retainBands(bands).getRenderedImage();
+                ColorModel colorModel = raster.getColorModel();
+                if (colorModel == null) {
+                    ImageLayout layout = (ImageLayout) hints.get(JAI.KEY_IMAGE_LAYOUT);
+                    if (layout == null) {
+                        layout = new ImageLayout();
+                    }
+                    ColorModel newColorModel =ImageIOUtilities.createColorModel(raster.getSampleModel());
+                    if(newColorModel != null) {
+                        layout.setColorModel(newColorModel);
+                        raster = new ImageWorker(raster).setRenderingHints(hints).format(raster.getSampleModel().getDataType()).getRenderedImage();
+                    }
+                }
+            }
+
             // use fixed source area
             sourceArea.setRect(readParameters.getSourceRegion());
 
@@ -1013,7 +1053,7 @@ public class GranuleDescriptor {
             if (XAffineTransform.isIdentity(finalRaster2Model,
                     CoverageUtilities.AFFINE_IDENTITY_EPS)) {
                 return new GranuleLoadingResult(raster, null, granuleURLUpdated, doFiltering,
-                        pamDataset);
+                        pamDataset, this);
             } else {
                 //
                 // In case we are asked to use certain tile dimensions we tile
@@ -1078,7 +1118,7 @@ public class GranuleDescriptor {
                     renderedImage = t;
                 }
                 return new GranuleLoadingResult(renderedImage, null, granuleURLUpdated, doFiltering,
-                        pamDataset);
+                        pamDataset, this);
             }
 
         } catch (IllegalStateException e) {

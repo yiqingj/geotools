@@ -32,6 +32,7 @@ import java.awt.image.RenderedImage;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -56,12 +57,14 @@ import org.geotools.coverage.grid.GridCoverage2D;
 import org.geotools.coverage.grid.GridCoverageFactory;
 import org.geotools.coverage.grid.GridEnvelope2D;
 import org.geotools.coverage.grid.GridGeometry2D;
+import org.geotools.coverage.grid.io.AbstractGridFormat;
 import org.geotools.coverage.grid.io.GridCoverage2DReader;
 import org.geotools.factory.Hints;
 import org.geotools.geometry.GeneralEnvelope;
 import org.geotools.geometry.jts.JTS;
 import org.geotools.geometry.jts.ReferencedEnvelope;
 import org.geotools.image.ImageWorker;
+import org.geotools.parameter.Parameter;
 import org.geotools.referencing.CRS;
 import org.geotools.referencing.operation.builder.GridToEnvelopeMapper;
 import org.geotools.referencing.operation.matrix.XAffineTransform;
@@ -74,13 +77,18 @@ import org.geotools.resources.i18n.ErrorKeys;
 import org.geotools.resources.i18n.Errors;
 import org.geotools.resources.image.ColorUtilities;
 import org.geotools.resources.image.ImageUtilities;
+import org.geotools.styling.ChannelSelection;
 import org.geotools.styling.RasterSymbolizer;
-import org.jaitools.imageutils.ImageLayout2;
-import org.jaitools.imageutils.ROIGeometry;
+import org.geotools.styling.SelectedChannelType;
+import org.geotools.styling.SelectedChannelTypeImpl;
+import it.geosolutions.jaiext.utilities.ImageLayout2;
+import it.geosolutions.jaiext.vectorbin.ROIGeometry;
 import org.opengis.coverage.grid.GridCoverage;
+import org.opengis.coverage.grid.GridCoverageReader;
 import org.opengis.geometry.BoundingBox;
 import org.opengis.metadata.spatial.PixelOrientation;
 import org.opengis.parameter.GeneralParameterValue;
+import org.opengis.parameter.ParameterValue;
 import org.opengis.referencing.FactoryException;
 import org.opengis.referencing.crs.CoordinateReferenceSystem;
 import org.opengis.referencing.datum.PixelInCell;
@@ -490,8 +498,10 @@ public final class GridCoverageRenderer {
      */
     private GridCoverage2D reproject(GridCoverage2D preResample, boolean doReprojection, double[] bkgValues) throws FactoryException {
         GridCoverage2D afterReprojection=null;
-        try{
+        try {
             if (doReprojection) {
+                // always have a ROI to account for pixels outside the image
+                preResample = addRoiIfMissing(preResample);
                 afterReprojection = GridCoverageRendererUtilities.reproject(
                         preResample, 
                         destinationCRS,
@@ -777,6 +787,15 @@ public final class GridCoverageRenderer {
         // see if we have a projection handler
         CoordinateReferenceSystem sourceCRS = reader.getCoordinateReferenceSystem();
         CoordinateReferenceSystem targetCRS = destinationEnvelope.getCoordinateReferenceSystem();
+        
+        // Check if reader supports band selection, and rearrange raster channels order in
+        // symbolizer. Reader should have taken care o proper channel order, based on initial
+        // symbolizer channel definition
+        RasterSymbolizer finalSymbolizer = symbolizer;
+        if (isBandsSelectionApplicable(reader, symbolizer)){
+            readParams = applyBandsSelectionParameter(reader, readParams, symbolizer);
+            finalSymbolizer = setupSymbolizerForBandsSelection(symbolizer);
+        }
 
         ProjectionHandler handler = null;
         List<GridCoverage2D> coverages;
@@ -863,40 +882,6 @@ public final class GridCoverageRenderer {
             coverages = cropped;
         }
 
-        /////////////////////////////////////////////////////
-        //
-        // Check if Mosaiking and reprojection must be done,
-        // if so we must add a ROIin order to avoid mosaiking issues
-        //
-        /////////////////////////////////////////////////////
-        // TODO optimize by checking if reprojection adds rotational elements
-        if (coverages.size() > 1 && reprojectionNeeded) {
-            // See if we need to add a ROI to the current images
-            for (int i = 0; i < coverages.size(); i++) {
-                GridCoverage2D coverage = coverages.get(i);
-                if (coverage == null) {
-                    continue;
-                }
-                RenderedImage input = coverage.getRenderedImage();
-                Object roiObject = input.getProperty("ROI");
-                Object gcRoiObject = coverage.getProperty("GC_ROI");
-                if (!(roiObject instanceof ROI) && !(gcRoiObject instanceof ROI)) {
-                    Envelope env = new Envelope(input.getMinX(), input.getMinX() + input.getWidth(),
-                            input.getMinY(), input.getMinY() + input.getHeight());
-                    ROI roi = new ROI(new ROIGeometry(JTS.toGeometry(env)).getAsImage());
-                    PlanarImage pi = PlanarImage.wrapRenderedImage(input);
-                    pi.setProperty("ROI", roi);
-                    Map properties = new HashMap(coverage.getProperties());
-                    properties.put("GC_ROI", roi);
-                    GridCoverage2D coverageWithRoi = gridCoverageFactory.create(coverage.getName(),
-                            pi, coverage.getGridGeometry(), null, new GridCoverage2D[] { coverage },
-                            properties);
-                    coverages.set(i, coverageWithRoi);
-
-                }
-            }
-        }
-
         // reproject if needed
         List<GridCoverage2D> reprojectedCoverages = new ArrayList<GridCoverage2D>();
         for (GridCoverage2D coverage : coverages) {
@@ -974,7 +959,7 @@ public final class GridCoverageRenderer {
         List<GridCoverage2D> symbolizedCoverages = new ArrayList<>();
         int ii = 0;
         for (GridCoverage2D displaced : displacedCoverages) {
-            GridCoverage2D symbolized = symbolize(displaced, symbolizer,
+            GridCoverage2D symbolized = symbolize(displaced, finalSymbolizer,
                     bgValues);
             symbolizedCoverages.add(symbolized);
             ii++;
@@ -1013,6 +998,34 @@ public final class GridCoverageRenderer {
         
         return cropped.getRenderedImage();
 
+    }
+
+    /**
+     * Forces adding ROI to the coverage in case it's missing. It will use the renderer image
+     * footprint.
+     * 
+     * @param coverage
+     * @return
+     */
+    private GridCoverage2D addRoiIfMissing(GridCoverage2D coverage) {
+        RenderedImage input = coverage.getRenderedImage();
+        Object roiObject = input.getProperty("ROI");
+        Object gcRoiObject = coverage.getProperty("GC_ROI");
+        if (!(roiObject instanceof ROI) && !(gcRoiObject instanceof ROI)) {
+            Envelope env = new Envelope(input.getMinX(), input.getMinX() + input.getWidth(),
+                    input.getMinY(), input.getMinY() + input.getHeight());
+            ROI roi = new ROI(new ROIGeometry(JTS.toGeometry(env)).getAsImage());
+            PlanarImage pi = PlanarImage.wrapRenderedImage(input);
+            pi.setProperty("ROI", roi);
+            final Map sourceProperties = coverage.getProperties();
+            Map properties = sourceProperties == null ? new HashMap() : new HashMap(sourceProperties);
+            properties.put("GC_ROI", roi);
+            return gridCoverageFactory.create(coverage.getName(),
+                    pi, coverage.getGridGeometry(), null, new GridCoverage2D[] { coverage },
+                    properties);
+        } else {
+            return coverage;
+        }
     }
 
     /**
@@ -1164,8 +1177,17 @@ public final class GridCoverageRenderer {
 
         setupInterpolationHints(interpolation);
         
+        RasterSymbolizer finalSymbolizer = symbolizer;
+        //
+        // Band selection
+        //
+        if (isBandsSelectionApplicable(gridCoverageReader, symbolizer)){
+            applyBandsSelectionParameter(gridCoverageReader, readParams, symbolizer);
+            finalSymbolizer = setupSymbolizerForBandsSelection(symbolizer);
+        }
+
         // Build the final image and the transformation
-        RenderedImage finalImage = renderImage(gridCoverageReader, readParams, symbolizer,
+        RenderedImage finalImage = renderImage(gridCoverageReader, readParams, finalSymbolizer,
                 interpolation, background);
         if (finalImage != null) {
             try {
@@ -1178,14 +1200,22 @@ public final class GridCoverageRenderer {
         }
     }
 
-    private void paintImage(final Graphics2D graphics, RenderedImage finalImage) {
+    private void paintImage(final Graphics2D graphics, RenderedImage inputImage) {
         final RenderingHints oldHints = graphics.getRenderingHints();
         graphics.setRenderingHints(this.hints);
+        
+        // nothing to do if the input image is null
+        if (inputImage == null) {
+            return;
+        }
 
+        // force transparency on NODATA and ROI
+        RenderedImage transparentImage = new ImageWorker(inputImage).prepareForRendering().getRenderedImage();
+        
         try {
             // debug
             if (DEBUG) {
-                writeRenderedImage(finalImage, "final");
+                writeRenderedImage(transparentImage, "final");
             }
 
             // force solid alpha, the transparency has already been
@@ -1196,7 +1226,7 @@ public final class GridCoverageRenderer {
             // //
             // Drawing the Image
             // //
-            graphics.drawRenderedImage(finalImage, GridCoverageRenderer.IDENTITY);
+            graphics.drawRenderedImage(transparentImage, GridCoverageRenderer.IDENTITY);
 
         } catch (Throwable t) {
             try {
@@ -1210,16 +1240,16 @@ public final class GridCoverageRenderer {
                 // /////////////////////////////////////////////////////////////
                 if (t instanceof IllegalArgumentException) {
                     if (DEBUG) {
-                        writeRenderedImage(finalImage, "preWORKAROUND1");
+                        writeRenderedImage(transparentImage, "preWORKAROUND1");
                     }
-                    final RenderedImage image = new ImageWorker(finalImage)
+                    final RenderedImage componentImage = new ImageWorker(transparentImage)
                             .forceComponentColorModel(true).getRenderedImage();
 
                     if (DEBUG) {
-                        writeRenderedImage(image, "WORKAROUND1");
+                        writeRenderedImage(componentImage, "WORKAROUND1");
 
                     }
-                    graphics.drawRenderedImage(image, GridCoverageRenderer.IDENTITY);
+                    graphics.drawRenderedImage(componentImage, GridCoverageRenderer.IDENTITY);
 
                 } else if (t instanceof ImagingOpException)
                 // /////////////////////////////////////////////////////////////
@@ -1238,18 +1268,18 @@ public final class GridCoverageRenderer {
                 // LARGE IMAGES.
                 // /////////////////////////////////////////////////////////////
                 {
-                    BufferedImage buf = finalImage.getColorModel().hasAlpha() ? new BufferedImage(
-                            finalImage.getWidth(), finalImage.getHeight(),
+                    BufferedImage buf = transparentImage.getColorModel().hasAlpha() ? new BufferedImage(
+                            transparentImage.getWidth(), transparentImage.getHeight(),
                             BufferedImage.TYPE_4BYTE_ABGR) : new BufferedImage(
-                            finalImage.getWidth(), finalImage.getHeight(),
+                            transparentImage.getWidth(), transparentImage.getHeight(),
                             BufferedImage.TYPE_3BYTE_BGR);
                     if (DEBUG) {
                         writeRenderedImage(buf, "preWORKAROUND2");
                     }
                     final Graphics2D g = (Graphics2D) buf.getGraphics();
-                    final int translationX = finalImage.getMinX(), translationY = finalImage
+                    final int translationX = transparentImage.getMinX(), translationY = transparentImage
                             .getMinY();
-                    g.drawRenderedImage(finalImage,
+                    g.drawRenderedImage(transparentImage,
                             AffineTransform.getTranslateInstance(-translationX, -translationY));
                     g.dispose();
                     if (DEBUG) {
@@ -1279,6 +1309,63 @@ public final class GridCoverageRenderer {
                 graphics.setRenderingHints(oldHints);
             }
         }
+    }
+    
+	private GeneralParameterValue[] applyBandsSelectionParameter(GridCoverageReader reader,
+			GeneralParameterValue[] readParams, RasterSymbolizer symbolizer) {
+		int[] bandIndices = ChannelSelectionUpdateStyleVisitor.getBandIndicesFromSelectionChannels(symbolizer);
+		Parameter<int[]> bandIndicesParam = null;
+		bandIndicesParam = (Parameter<int[]>) AbstractGridFormat.BANDS.createValue();
+		bandIndicesParam.setValue(bandIndices);
+		List<GeneralParameterValue> paramList = new ArrayList<GeneralParameterValue>();
+		if (readParams != null) {
+			paramList.addAll(Arrays.asList(readParams));
+		}
+		paramList.add(bandIndicesParam);
+		return paramList.toArray(new GeneralParameterValue[paramList.size()]);
+	}
+    
+    /**
+     * Takes into account that the band selection has been delegated down to the reader by
+     * producing a new channel selection
+     * 
+     * @param symbolizer
+     * @return
+     */
+    public static RasterSymbolizer setupSymbolizerForBandsSelection(
+            RasterSymbolizer symbolizer) {
+        ChannelSelection selection = symbolizer.getChannelSelection();
+        final SelectedChannelType[] originalChannels = selection.getSelectedChannels();
+        if (originalChannels != null) {
+            int i = 0;
+            SelectedChannelType[] channels = new SelectedChannelType[originalChannels.length];
+            for (SelectedChannelType originalChannel : originalChannels) {
+                // Remember, channel indices start from 1
+                SelectedChannelTypeImpl channel = new SelectedChannelTypeImpl();
+                channel.setChannelName(Integer.toString(i + 1));
+                channel.setContrastEnhancement(originalChannel.getContrastEnhancement());
+                i++;
+            }
+            ChannelSelectionUpdateStyleVisitor channelsUpdateVisitor = new ChannelSelectionUpdateStyleVisitor(channels);
+            symbolizer.accept(channelsUpdateVisitor);
+            return (RasterSymbolizer) channelsUpdateVisitor.getCopy();
+        }
+        return symbolizer;
+    }
+    
+    /**
+     * Checks if band selection is present, and can be delegated down to the reader
+     * @param reader
+     * @param symbolizer
+     * @return
+     */
+    public static boolean isBandsSelectionApplicable(GridCoverageReader reader,
+            RasterSymbolizer symbolizer){
+        int[] bandIndices = ChannelSelectionUpdateStyleVisitor
+                .getBandIndicesFromSelectionChannels(symbolizer);
+        return reader.getFormat() != null && reader.getFormat().getReadParameters().getDescriptor()
+                .descriptors().contains(AbstractGridFormat.BANDS) && bandIndices != null;
+        
     }
 
 }

@@ -18,10 +18,8 @@ package org.geotools.gce.imagemosaic;
 
 import java.awt.*;
 import java.awt.geom.AffineTransform;
-import java.awt.image.ColorModel;
-import java.awt.image.IndexColorModel;
-import java.awt.image.RenderedImage;
-import java.awt.image.SampleModel;
+import java.awt.geom.Point2D;
+import java.awt.image.*;
 import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.util.ArrayList;
@@ -45,6 +43,7 @@ import javax.media.jai.RenderedOp;
 import javax.media.jai.operator.ConstantDescriptor;
 import javax.media.jai.operator.MosaicDescriptor;
 
+import it.geosolutions.imageio.utilities.ImageIOUtilities;
 import org.geotools.coverage.Category;
 import org.geotools.coverage.GridSampleDimension;
 import org.geotools.coverage.TypeMap;
@@ -62,6 +61,7 @@ import org.geotools.filter.SortByImpl;
 import org.geotools.gce.imagemosaic.OverviewsController.OverviewLevel;
 import org.geotools.gce.imagemosaic.RasterManager.DomainDescriptor;
 import org.geotools.gce.imagemosaic.catalog.GranuleCatalogVisitor;
+import org.geotools.gce.imagemosaic.egr.ROIExcessGranuleRemover;
 import org.geotools.gce.imagemosaic.granulecollector.DefaultSubmosaicProducerFactory;
 import org.geotools.gce.imagemosaic.granulecollector.DefaultSubmosaicProducer;
 import org.geotools.gce.imagemosaic.granulecollector.SubmosaicProducer;
@@ -78,11 +78,12 @@ import org.geotools.resources.coverage.FeatureUtilities;
 import org.geotools.resources.geometry.XRectangle2D;
 import org.geotools.resources.i18n.Vocabulary;
 import org.geotools.resources.i18n.VocabularyKeys;
+import it.geosolutions.imageio.imageioimpl.EnhancedImageReadParam;
 import org.geotools.resources.image.ImageUtilities;
 import org.geotools.util.NumberRange;
 import org.geotools.util.SimpleInternationalString;
 import org.geotools.util.Utilities;
-import org.jaitools.imageutils.ImageLayout2;
+import it.geosolutions.jaiext.utilities.ImageLayout2;
 import org.opengis.coverage.ColorInterpretation;
 import org.opengis.coverage.SampleDimension;
 import org.opengis.coverage.SampleDimensionType;
@@ -325,8 +326,8 @@ public class RasterLayerResponse {
                     }
                 }
 
-                // did we find a place for it?
-                if (!found) {
+                // did we find a place for it? If we are doing EGR then it's ok, otherwise not so much
+                if (!found && getExcessGranuleRemover() == null) {
                     throw new IllegalStateException("Unable to locate a filter for this granule:\n"
                             + granuleDescriptor.toString());
                 }
@@ -337,6 +338,12 @@ public class RasterLayerResponse {
                             + granuleDescriptor.toString());
                 }
             }
+        }
+        
+        @Override
+        public boolean isVisitComplete() {
+            ROIExcessGranuleRemover remover = getExcessGranuleRemover();
+            return remover != null && remover.isRenderingAreaComplete();
         }
 
         /**
@@ -446,7 +453,7 @@ public class RasterLayerResponse {
 
     private int imageChoice = 0;
 
-    private ImageReadParam baseReadParameters = new ImageReadParam();
+    private EnhancedImageReadParam baseReadParameters = new EnhancedImageReadParam();
 
     private boolean multithreadingAllowed;
 
@@ -469,6 +476,8 @@ public class RasterLayerResponse {
     private Hints hints;
 
     private String granulesPaths;
+    
+    private ROIExcessGranuleRemover excessGranuleRemover;
 
     /**
      * Construct a {@code RasterLayerResponse} given a specific {@link RasterLayerRequest}, a {@code GridCoverageFactory} to produce
@@ -534,6 +543,9 @@ public class RasterLayerResponse {
             return;
         }
 
+        // add extra parameters to image parameters reader
+        baseReadParameters.setBands(request.getBands());
+
         // assemble granules
         final MosaicOutput mosaic = prepareResponse();
         if (mosaic == null || mosaic.image == null) {
@@ -588,6 +600,9 @@ public class RasterLayerResponse {
 
             // === init raster bounds
             initRasterBounds();
+            
+            // === init excess granule removal if needed
+            initExcessGranuleRemover();
 
             // === create query and basic BBOX filtering
             final Query query = initQuery();
@@ -662,6 +677,20 @@ public class RasterLayerResponse {
         }
     }
 
+    private void initExcessGranuleRemover() {
+        if(request.getExcessGranuleRemovalPolicy() == ExcessGranulePolicy.ROI) {
+            Dimension tileDimensions = request.getTileDimensions();
+            int tileWidth, tileHeight;
+            if(tileDimensions != null) {
+                tileWidth = (int) tileDimensions.getWidth();
+                tileHeight = (int) tileDimensions.getHeight();
+            } else {
+                tileWidth = tileHeight = ROIExcessGranuleRemover.DEFAULT_TILE_SIZE;
+            }
+            excessGranuleRemover = new ROIExcessGranuleRemover(rasterBounds, tileWidth, tileHeight, rasterManager.getConfiguration().getCrs());
+        }
+    }
+
     /**
      * This method is responsible for computing the raster bounds of the final mosaic.
      *
@@ -692,6 +721,7 @@ public class RasterLayerResponse {
         // compute final world to grid
         // base grid to world for the center of pixels
         final AffineTransform g2w;
+        final SpatialRequestHelper spatialRequestHelper = request.spatialRequestHelper;
         if (!request.isHeterogeneousGranules()) {
             final OverviewLevel baseLevel = rasterManager.overviewsController.resolutionsLevels
                     .get(0);
@@ -699,16 +729,28 @@ public class RasterLayerResponse {
                     .get(imageChoice);
             final double resX = baseLevel.resolutionX;
             final double resY = baseLevel.resolutionY;
-            final double[] requestRes = request.spatialRequestHelper.getComputedResolution();
-
-            g2w = new AffineTransform((AffineTransform) baseGridToWorld);
+            final double[] requestRes = spatialRequestHelper.getComputedResolution();
+            
+            BoundingBox computedBBox = spatialRequestHelper.getComputedBBox();
+            GeneralEnvelope requestedRasterArea = CRS.transform(baseGridToWorld.inverse(), computedBBox);
+            double minxRaster = Math.round(requestedRasterArea.getMinimum(0));
+            double minyRaster = Math.round(requestedRasterArea.getMinimum(1));
+            
+            // rebase the grid to world location to a position close to the requested one to
+            // avoid JAI playing with very large raster coordinates
+            // This can be done because the final computation generates the coordinates of the
+            // output coverage based on the output raster bounds and this very transform
+            final AffineTransform at = (AffineTransform) baseGridToWorld;
+            Point2D src = new Point2D.Double(minxRaster, minyRaster);
+            Point2D dst = new Point2D.Double();
+            at.transform(src, dst);
+            g2w = new AffineTransform(at.getScaleX(), at.getShearX(), at.getShearY(), at.getScaleY(), dst.getX(), dst.getY());
             g2w.concatenate(CoverageUtilities.CENTER_TO_CORNER);
 
             if ((requestRes[0] < resX || requestRes[1] < resY)) {
                 // Using the best available resolution
                 oversampledRequest = true;
             } else {
-
                 // SG going back to working on a per level basis to do the composition
                 // g2w = new AffineTransform(request.getRequestedGridToWorld());
                 g2w.concatenate(AffineTransform.getScaleInstance(selectedLevel.scaleFactor,
@@ -718,9 +760,7 @@ public class RasterLayerResponse {
                                 baseReadParameters.getSourceYSubsampling()));
             }
         } else {
-            g2w = new AffineTransform(request.spatialRequestHelper.isNeedsReprojection()
-                    ? request.spatialRequestHelper.getComputedGridToWorld()
-                    : request.spatialRequestHelper.getComputedGridToWorld());
+            g2w = new AffineTransform(spatialRequestHelper.getComputedGridToWorld());
             g2w.concatenate(CoverageUtilities.CENTER_TO_CORNER);
         }
         // move it to the corner
@@ -1046,13 +1086,33 @@ public class RasterLayerResponse {
         final RenderedImage image = mosaicOutput.image;
         final SampleModel sm = image.getSampleModel();
         final ColorModel cm = image.getColorModel();
-        final int numBands = sm.getNumBands();
+        final int numBands = request.getBands() == null ? sm.getNumBands() : request.getBands().length;
+        // quick check the possible provided bands names are equal the number of bands
+        if (rasterManager.providedBandsNames != null && rasterManager.providedBandsNames.length != numBands) {
+            // let's see if bands have been selected
+            if (request.getBands() == null) {
+                // no definitively there is something wrong
+                throw new IllegalArgumentException("The number of provided bands names is different from the number of bands.");
+            }
+        }
         final GridSampleDimension[] bands = new GridSampleDimension[numBands];
         Set<String> bandNames = new HashSet<String>();
         // setting bands names.
         for (int i = 0; i < numBands; i++) {
             ColorInterpretation colorInterpretation = null;
             String bandName = null;
+
+            // checking if bands names are provided, typical case for multiple bands dimensions
+            if (rasterManager.providedBandsNames != null) {
+                // we need to take in consideration if bands were selected
+                if (request.getBands() == null) {
+                    bandName = rasterManager.providedBandsNames[i];
+                } else {
+                    // using the selected band index to retrieve the correct provided name
+                    bandName = rasterManager.providedBandsNames[request.getBands()[i]];
+                }
+            }
+
             if (cm != null) {
                 // === color interpretation
                 colorInterpretation = TypeMap.getColorInterpretation(cm, i);
@@ -1060,13 +1120,17 @@ public class RasterLayerResponse {
                     throw new IOException("Unrecognized sample dimension type");
                 }
 
-                bandName = colorInterpretation.name();
-                if (colorInterpretation == ColorInterpretation.UNDEFINED
-                        || bandNames.contains(bandName)) {// make sure we create no duplicate band names
-                    bandName = "Band" + (i + 1);
+                if (bandName == null) {
+                    bandName = colorInterpretation.name();
+                    if (colorInterpretation == ColorInterpretation.UNDEFINED
+                            || bandNames.contains(bandName)) {// make sure we create no duplicate band names
+                        bandName = "Band" + (i + 1);
+                    }
                 }
             } else { // no color model
-                bandName = "Band" + (i + 1);
+                if (bandName == null) {
+                    bandName = "Band" + (i + 1);
+                }
                 colorInterpretation = ColorInterpretation.UNDEFINED;
             }
 
@@ -1244,5 +1308,9 @@ public class RasterLayerResponse {
 
     public double[] getBackgroundValues() {
         return backgroundValues;
+    }
+
+    public ROIExcessGranuleRemover getExcessGranuleRemover() {
+        return excessGranuleRemover;
     }
 }
